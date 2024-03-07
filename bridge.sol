@@ -22,6 +22,7 @@ interface usdtContract
     function transfer(address _to, uint256 _amount) external;
     function mint(address account, uint256 value) external;
     function burn(address account, uint256 value) external;
+    function balanceOf(address user) external view returns(uint256);
 }
 
 
@@ -86,11 +87,14 @@ contract Bridge is owned {
     uint256 public orderID;
     uint256 public exraCoinRewards;   // if we give users extra coins to cover gas cost of some initial transactions.
 
-    address feeWallet;
-    address reserveWallet;
-    address usdtAddress = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    uint256 reserveFundThreshold = 10e18;
-    
+    address public feeWallet;
+    address public reserveWallet;
+    address public usdtAddress = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    uint256 public reserveFundThreshold = 10e18;
+
+    /* This mapping contains the status of tokenAddresses who are not under our control like those which we cannot burn or mint*/
+    mapping(address=>bool) public noControl;
+    mapping(address=>uint256) public tokenFundThreshold;
     
 
     // This generates a public event of coin received by contract
@@ -107,6 +111,16 @@ contract Bridge is owned {
     receive () external payable {
         //nothing happens for incoming fund
     }
+
+    constructor(){
+        noControl[0xdAC17F958D2ee523a2206206994597C13D831ec7] = true; /*USDT Ethereum*/
+        noControl[0x55d398326f99059fF775485246999027B3197955] = true; /*USDT Binance*/
+        noControl[0xc2132D05D31c914a87C6611C10748AEb04B58e8F] = true; /*USDT Matic*/
+
+        tokenFundThreshold[0xdAC17F958D2ee523a2206206994597C13D831ec7] = 100e6; /*USDT Ethereum*/
+        tokenFundThreshold[0x55d398326f99059fF775485246999027B3197955] = 100e6; /*USDT Binance*/
+        tokenFundThreshold[0xc2132D05D31c914a87C6611C10748AEb04B58e8F] = 100e6; /*USDT Matic*/
+    }
     
     function coinIn(address outputCurrency) external payable returns(bool){
         orderID++;
@@ -117,21 +131,17 @@ contract Bridge is owned {
         (afterTax,tax) = processTax(amount);
         payable(feeWallet).transfer(tax);
 
-        // payable(owner).transfer(msg.value);     //send fund to owner
         if(address(this).balance >= reserveFundThreshold){
-            payable(owner).transfer(address(this).balance);
+            payable(owner).transfer(afterTax);
         }
-
 
         emit CoinIn(orderID, msg.sender, afterTax, outputCurrency);
         return true;
     }
     
     function coinOut(address user, uint256 amount, uint256 _orderID) external onlySigner returns(bool){
-        
             payable(user).transfer(amount);
             emit CoinOut(_orderID, user, amount);
-        
         return true;
     }
     
@@ -140,28 +150,48 @@ contract Bridge is owned {
         orderID++;
         uint256 burnt;
         uint256 tax;
-        (tokenAmount, tax) = processTax(tokenAmount);
-        //fund will go to the owner
-        if(tokenAddress == usdtAddress){
-            //There should be different interface for the USDT Ethereum contract
-            usdtContract(tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
-            usdtContract(tokenAddress).transfer(feeWallet, tax);
-            burnt = burnTokens(tokenAddress, tokenAmount);
+        uint256 afterTax;
+        (afterTax, tax) = processTax(tokenAmount);
+
+        if(noControl[tokenAddress]){
+            if(tokenAddress == usdtAddress){
+                usdtContract(tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
+                usdtContract(tokenAddress).transfer(feeWallet, tax);
+                if(usdtContract(tokenAddress).balanceOf(address(this)) >= tokenFundThreshold[tokenAddress]){
+                    usdtContract(tokenAddress).transfer(owner, afterTax);
+                }
+                
+            }else{
+                ERC20Essential(tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
+                ERC20Essential(tokenAddress).transfer(feeWallet, tax);
+                if(usdtContract(tokenAddress).balanceOf(address(this)) >= tokenFundThreshold[tokenAddress]){
+                    ERC20Essential(tokenAddress).transfer(owner, afterTax);
+                }
+            }
         }else{
             ERC20Essential(tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
             ERC20Essential(tokenAddress).transfer(feeWallet, tax);
-            burnt = burnTokens(tokenAddress, tokenAmount);
+            burnt = burnTokens(tokenAddress, afterTax);
         }
 
-        emit TokenIn(orderID, tokenAddress, msg.sender, tokenAmount, chainID, outputCurrency);
+        emit TokenIn(orderID, tokenAddress, msg.sender, afterTax, chainID, outputCurrency);
         return true;
     }
     
     
     function tokenOut(address tokenAddress, address user, uint256 tokenAmount, uint256 _orderID, uint256 chainID) external onlySigner returns(bool){
-       
-            // ERC20Essential(tokenAddress).transfer(user, tokenAmount);
-            (uint256 minted,) = mintTokens(tokenAddress, user, tokenAmount);
+        uint256 minted = tokenAmount;
+            if(noControl[tokenAddress]){
+                if(tokenAddress == usdtAddress){
+                    usdtContract(tokenAddress).transfer(user, tokenAmount);
+                }else{
+                    ERC20Essential(tokenAddress).transfer(user, tokenAmount);
+                }
+                
+            }else{
+                (minted,) = mintTokens(tokenAddress, user, tokenAmount);
+            }
+            
             emit TokenOut(_orderID, tokenAddress, user, minted, chainID);
         
         return true;
@@ -226,6 +256,20 @@ contract Bridge is owned {
         oldOwner = ERC20Essential(ofTokenAddress).owner();
         ERC20Essential(ofTokenAddress).transferOwnership(toAddress);
         newOwner = ERC20Essential(ofTokenAddress).owner();
+    }
+
+    /*Add noControl tokens i.e, the token on which you dont have burning and minting capabilities
+    * Set the status to true if you cannot mint or burn 
+    * Set the status to false if you can mint or burn*/
+    function setNoControl(address tokenAddress, bool status) external onlyOwner{
+        require(tokenAddress != address(0), "cannot set zero address");
+        noControl[tokenAddress] = status;
+    }
+
+    /* Modify the token reserve threshold values
+    */
+    function setTokenReserveThreshold(address forToken, uint256 threshold) external onlyOwner{
+        tokenFundThreshold[forToken] = threshold;
     }
 
 }
